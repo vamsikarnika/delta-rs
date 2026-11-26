@@ -1,12 +1,13 @@
-use arrow_array::Int32Array;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use serde_json::{Value, json};
 
 use crate::ffi::FfiDeltaScanContext;
-use crate::reader::selection_from_deleted;
+use crate::reader::drop_deleted;
 use crate::{delta_free_arrow_stream, new_delta_file_reader};
 
+const VALUE_INT: &str = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
 const DATA_FILE: &str = "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet";
 
 fn table_dir() -> std::path::PathBuf {
@@ -38,22 +39,26 @@ fn ctx(root: &str, dv: &str) -> FfiDeltaScanContext {
         file_path: table_dir().join(DATA_FILE).to_string_lossy().into_owned(),
         file_size: 635,
         dv_descriptor_json: dv.to_string(),
-        projected_columns: vec![],
-        batch_size: 0,
+        physical_schema_json: VALUE_INT.to_string(),
         props_keys: vec![],
         props_values: vec![],
     }
 }
 
 /// Goes through the same calls and Arrow C stream hand-off that Velox makes.
-fn read_values(ctx: FfiDeltaScanContext) -> Result<Vec<i32>, String> {
+fn read_batches(ctx: FfiDeltaScanContext) -> Result<Vec<RecordBatch>, String> {
     let reader = new_delta_file_reader(ctx)?;
     let ptr = reader.read()?;
     let stream = unsafe { ArrowArrayStreamReader::from_raw(ptr as *mut FFI_ArrowArrayStream) }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    let out = stream.and_then(|s| s.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string()));
+    unsafe { delta_free_arrow_stream(ptr) };
+    out
+}
+
+fn read_values(ctx: FfiDeltaScanContext) -> Result<Vec<i32>, String> {
     let mut out = vec![];
-    for batch in stream {
-        let batch = batch.map_err(|e| e.to_string())?;
+    for batch in read_batches(ctx)? {
         let col = batch
             .column(0)
             .as_any()
@@ -61,7 +66,6 @@ fn read_values(ctx: FfiDeltaScanContext) -> Result<Vec<i32>, String> {
             .unwrap();
         out.extend(col.values().iter().copied());
     }
-    unsafe { delta_free_arrow_stream(ptr) };
     Ok(out)
 }
 
@@ -158,56 +162,111 @@ fn malformed_descriptor_is_an_error() {
 }
 
 #[test]
-fn projection_reads_named_columns_and_missing_column_is_an_error() {
-    let dv = logged_descriptor().to_string();
-    let mut c = ctx(root_url().as_str(), &dv);
-    c.projected_columns = vec!["value".into()];
-    assert_eq!(read_values(c).unwrap(), LIVE);
-    let mut c = ctx(root_url().as_str(), &dv);
-    c.projected_columns = vec!["nope".into()];
-    assert!(read_values(c).unwrap_err().contains("not found"));
-}
-
-#[test]
-fn small_batches_do_not_change_the_result() {
-    let dv = logged_descriptor().to_string();
-    let mut c = ctx(root_url().as_str(), &dv);
-    c.batch_size = 3;
-    assert_eq!(read_values(c).unwrap(), LIVE);
-}
-
-#[test]
 fn unsupported_locations_are_rejected() {
     let mut c = ctx("", "");
     c.file_path = "s3://bucket/key.parquet".into();
     assert!(new_delta_file_reader(c).is_err());
 }
 
-/// `RowSelection` into (selected, skipped) flags per row, for readable assertions.
-fn keep_mask(deleted: &[u64], num_rows: u64) -> Vec<bool> {
-    let mut mask = vec![];
-    for s in selection_from_deleted(deleted, num_rows).unwrap().iter() {
-        mask.extend(std::iter::repeat_n(!s.skip, s.row_count));
-    }
-    mask
+#[test]
+fn physical_schema_is_required() {
+    let mut c = ctx("", "");
+    c.physical_schema_json = String::new();
+    assert!(new_delta_file_reader(c).err().unwrap().contains("required"));
+    let mut c = ctx("", "");
+    c.physical_schema_json = "{nope".into();
+    assert!(new_delta_file_reader(c).is_err());
 }
 
 #[test]
-fn selection_covers_runs_edges_and_everything() {
-    assert_eq!(keep_mask(&[], 3), [true, true, true]);
-    assert_eq!(keep_mask(&[0], 3), [false, true, true]);
-    assert_eq!(keep_mask(&[2], 3), [true, true, false]);
+fn kernel_widens_integer_to_long() {
+    let dv = logged_descriptor().to_string();
+    let mut c = ctx(root_url().as_str(), &dv);
+    c.physical_schema_json = VALUE_INT.replace("integer", "long");
+    let batches = read_batches(c).unwrap();
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(
-        keep_mask(&[1, 2, 3, 6], 8),
-        [true, false, false, false, true, true, false, true]
+        col.values().iter().copied().collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6, 7, 8]
     );
-    assert_eq!(keep_mask(&[0, 1, 2], 3), [false, false, false]);
-    assert!(keep_mask(&[], 0).is_empty());
 }
 
 #[test]
-fn selection_rejects_rows_past_the_end() {
-    assert!(selection_from_deleted(&[3], 3).is_err());
+fn column_absent_from_the_file() {
+    // What the kernel does with a column the file does not have (e.g. added by schema evolution).
+    let dv = logged_descriptor().to_string();
+    let mut c = ctx(root_url().as_str(), &dv);
+    c.physical_schema_json = r#"{"type":"struct","fields":[
+        {"name":"value","type":"integer","nullable":true,"metadata":{}},
+        {"name":"added","type":"string","nullable":true,"metadata":{}}]}"#
+        .into();
+    let batches = read_batches(c).unwrap();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 8);
+    let added = batches[0].column(1);
+    assert_eq!(
+        added.null_count(),
+        added.len(),
+        "absent nullable column should read as null"
+    );
+}
+
+#[test]
+fn batch_schema_matches_stream_schema() {
+    let dv = logged_descriptor().to_string();
+    let batches = read_batches(ctx(root_url().as_str(), &dv)).unwrap();
+    assert_eq!(batches[0].schema().field(0).name(), "value");
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &arrow_schema::DataType::Int32
+    );
+}
+
+/// Builds `n` rows with values `start..start+n`.
+fn batch(start: i32, n: i32) -> RecordBatch {
+    let col = Int32Array::from((start..start + n).collect::<Vec<_>>());
+    RecordBatch::try_from_iter([("v", std::sync::Arc::new(col) as _)]).unwrap()
+}
+
+fn live_values(batches: &[(i32, i32)], deleted: &[u64]) -> Vec<i32> {
+    let mut cursor = 0;
+    let mut offset = 0u64;
+    let mut out = vec![];
+    for &(start, n) in batches {
+        let b = drop_deleted(batch(start, n), offset, deleted, &mut cursor).unwrap();
+        out.extend(
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+        );
+        offset += n as u64;
+    }
+    out
+}
+
+#[test]
+fn deleted_rows_are_dropped_across_batch_boundaries() {
+    // Two batches of 4: rows 0..4 and 4..8. Delete one at each edge of the boundary, plus a run.
+    assert_eq!(live_values(&[(0, 4), (4, 4)], &[3, 4]), [0, 1, 2, 5, 6, 7]);
+    assert_eq!(
+        live_values(&[(0, 4), (4, 4)], &[]),
+        [0, 1, 2, 3, 4, 5, 6, 7]
+    );
+    assert_eq!(live_values(&[(0, 4), (4, 4)], &[0, 1, 2, 3]), [4, 5, 6, 7]);
+    assert_eq!(live_values(&[(0, 4), (4, 4)], &[7]), [0, 1, 2, 3, 4, 5, 6]);
+    // A batch with nothing deleted in it passes through untouched.
+    assert_eq!(
+        live_values(&[(0, 2), (2, 2), (4, 2)], &[4]),
+        [0, 1, 2, 3, 5]
+    );
+    // Everything deleted leaves an empty batch, not an error.
+    assert!(live_values(&[(0, 3)], &[0, 1, 2]).is_empty());
 }
 
 const Z85: &[u8; 85] =

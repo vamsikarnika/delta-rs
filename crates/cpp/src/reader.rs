@@ -1,42 +1,41 @@
 //! Reads one Delta data file with its deletion vector applied.
 //!
-//! A split carries the file and the DV descriptor JSON that Spark hands the scan; no table snapshot
-//! is needed (see `crates/core/examples/dv_descriptor_spike.rs`).
+//! A split carries the file, the DV descriptor JSON that Spark hands the scan, and the physical
+//! schema to read. No table snapshot is needed (see `crates/core/examples/dv_descriptor_spike.rs`
+//! on the spike branch). Parquet reading, column matching (field id, then name) and type widening
+//! are the kernel's; this module adds the DV and the Arrow stream.
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, SchemaRef};
-use delta_kernel::Engine;
+use arrow_array::{BooleanArray, RecordBatch, RecordBatchReader};
+use arrow_schema::{ArrowError, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use arrow_select::filter::filter_record_batch;
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
-use delta_kernel_default_engine::DefaultEngineBuilder;
-use futures::{Stream, StreamExt};
-use object_store::ObjectStore;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::{Engine, FileMeta};
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use object_store::local::LocalFileSystem;
-use object_store::path::Path as StorePath;
-use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-// `ParquetObjectReader` is deprecated upstream in favour of implementing `AsyncFileReader`. It still
-// does exactly what we need on our own runtime; swap it when the object-store work lands.
-use parquet::arrow::ProjectionMask;
-#[allow(deprecated)]
-use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
-use tokio::runtime::Runtime;
 
-/// One runtime for every read: avoids per-split setup. Reads `block_on` it.
-pub fn shared_runtime() -> &'static Runtime {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| Runtime::new().expect("failed to build tokio runtime"))
+type SharedEngine = DefaultEngine<TokioBackgroundExecutor>;
+
+/// One engine for every split: it owns a background executor thread, so building one per split
+/// would spawn a thread per file.
+pub fn shared_engine() -> &'static SharedEngine {
+    static ENGINE: OnceLock<SharedEngine> = OnceLock::new();
+    ENGINE.get_or_init(|| DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
 }
 
-/// A data file location resolved to a store and a path inside it.
-pub struct FileLocation {
-    pub store: Arc<dyn ObjectStore>,
-    pub path: StorePath,
+/// A data file as the kernel wants it.
+pub struct DataFile {
+    pub meta: FileMeta,
 }
 
 /// Accepts an absolute local path or a `file://` URL. Other schemes are not supported yet.
-pub fn resolve_file(file_path: &str) -> Result<FileLocation, String> {
-    let local = if file_path.starts_with("file:") {
+/// `file_size <= 0` means unknown; it is looked up from the filesystem.
+pub fn resolve_file(file_path: &str, file_size: i64) -> Result<DataFile, String> {
+    let local: std::path::PathBuf = if file_path.starts_with("file:") {
         let url =
             url::Url::parse(file_path).map_err(|e| format!("bad file url {file_path}: {e}"))?;
         url.to_file_path()
@@ -48,11 +47,33 @@ pub fn resolve_file(file_path: &str) -> Result<FileLocation, String> {
             "unsupported data file location (local paths only for now): {file_path}"
         ));
     };
-    let path = StorePath::from_filesystem_path(&local).map_err(|e| e.to_string())?;
-    Ok(FileLocation {
-        store: Arc::new(LocalFileSystem::new()),
-        path,
+    let size = if file_size > 0 {
+        file_size as u64
+    } else {
+        std::fs::metadata(&local)
+            .map_err(|e| format!("cannot stat {file_path}: {e}"))?
+            .len()
+    };
+    let location = url::Url::from_file_path(&local)
+        .map_err(|_| format!("not an absolute path: {file_path}"))?;
+    Ok(DataFile {
+        meta: FileMeta {
+            location,
+            last_modified: 0,
+            size,
+        },
     })
+}
+
+/// Parses the physical schema: Delta schema JSON, as in the table's `schemaString` but with
+/// physical column names (column mapping) and field-id metadata where the table has them.
+pub fn parse_schema(schema_json: &str) -> Result<SchemaRef, String> {
+    if schema_json.is_empty() {
+        return Err("physical_schema_json is required".into());
+    }
+    let schema: StructType =
+        serde_json::from_str(schema_json).map_err(|e| format!("bad physical schema: {e}"))?;
+    Ok(Arc::new(schema))
 }
 
 /// Resolves a DV descriptor JSON to the sorted positions of deleted rows. `None` means no DV.
@@ -112,111 +133,164 @@ pub fn resolve_deleted_rows(
     Ok(Some(rows))
 }
 
-pub fn default_engine() -> impl Engine {
-    DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build()
+/// Drops the deleted rows from `batch`, which starts at file row `row_offset`. `cursor` indexes the
+/// first entry of `deleted` that is not yet behind the batch; it advances as batches go by.
+pub fn drop_deleted(
+    batch: RecordBatch,
+    row_offset: u64,
+    deleted: &[u64],
+    cursor: &mut usize,
+) -> Result<RecordBatch, ArrowError> {
+    let end = row_offset + batch.num_rows() as u64;
+    let start_cursor = *cursor;
+    while *cursor < deleted.len() && deleted[*cursor] < end {
+        *cursor += 1;
+    }
+    let in_batch = &deleted[start_cursor..*cursor];
+    if in_batch.is_empty() {
+        return Ok(batch);
+    }
+    let mut keep = vec![true; batch.num_rows()];
+    for d in in_batch {
+        keep[(*d - row_offset) as usize] = false;
+    }
+    filter_record_batch(&batch, &BooleanArray::from(keep))
 }
 
-/// Turns sorted deleted positions into a selection that skips them over `num_rows` rows.
-pub fn selection_from_deleted(deleted: &[u64], num_rows: u64) -> Result<RowSelection, String> {
-    if let Some(last) = deleted.last()
-        && *last >= num_rows
-    {
-        return Err(format!(
-            "deletion vector references row {last} but the file has {num_rows} rows"
-        ));
-    }
-    let mut selectors = Vec::new();
-    let mut next_live = 0u64;
-    let mut i = 0;
-    while i < deleted.len() {
-        let start = deleted[i];
-        let mut end = start + 1;
-        while i + 1 < deleted.len() && deleted[i + 1] == end {
-            i += 1;
-            end += 1;
-        }
-        if start > next_live {
-            selectors.push(RowSelector::select((start - next_live) as usize));
-        }
-        selectors.push(RowSelector::skip((end - start) as usize));
-        next_live = end;
-        i += 1;
-    }
-    if next_live < num_rows {
-        selectors.push(RowSelector::select((num_rows - next_live) as usize));
-    }
-    Ok(selectors.into())
+type KernelBatches = delta_kernel::FileDataReadResultIterator;
+
+fn external<E: std::error::Error + Send + Sync + 'static>(e: E) -> ArrowError {
+    ArrowError::ExternalError(Box::new(e))
 }
 
-/// Pulls batches from an async stream one at a time, on the shared runtime.
-struct BlockingReader<S> {
-    stream: S,
-    schema: SchemaRef,
+/// Streams the live rows of one file, one kernel batch at a time.
+struct LiveRows {
+    batches: KernelBatches,
+    schema: ArrowSchemaRef,
+    deleted: Vec<u64>,
+    cursor: usize,
+    row_offset: u64,
+    done: bool,
 }
 
-impl<S> Iterator for BlockingReader<S>
-where
-    S: Stream<Item = Result<RecordBatch, parquet::errors::ParquetError>> + Unpin,
-{
+impl Iterator for LiveRows {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        shared_runtime()
-            .block_on(self.stream.next())
-            .map(|r| r.map_err(|e| ArrowError::ExternalError(Box::new(e))))
+        if self.done {
+            return None;
+        }
+        match self.batches.next() {
+            Some(Err(e)) => {
+                self.done = true;
+                Some(Err(external(e)))
+            }
+            Some(Ok(data)) => {
+                let result = ArrowEngineData::try_from_engine_data(data)
+                    .map_err(external)
+                    .map(RecordBatch::from)
+                    .and_then(|batch| {
+                        let n = batch.num_rows() as u64;
+                        let out =
+                            drop_deleted(batch, self.row_offset, &self.deleted, &mut self.cursor)?;
+                        self.row_offset += n;
+                        Ok(out)
+                    });
+                if result.is_err() {
+                    self.done = true;
+                }
+                Some(result)
+            }
+            None => {
+                self.done = true;
+                // A DV that points past the end of the file means it belongs to a different
+                // version of the file, so the result cannot be trusted.
+                match self.deleted.get(self.cursor) {
+                    Some(d) => Some(Err(ArrowError::ExternalError(
+                        format!(
+                            "deletion vector references row {d} but the file has {} rows",
+                            self.row_offset
+                        )
+                        .into(),
+                    ))),
+                    None => None,
+                }
+            }
+        }
     }
 }
 
-impl<S> RecordBatchReader for BlockingReader<S>
-where
-    S: Stream<Item = Result<RecordBatch, parquet::errors::ParquetError>> + Unpin,
-{
-    fn schema(&self) -> SchemaRef {
+impl RecordBatchReader for LiveRows {
+    fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
 }
 
 /// Opens the file and returns a reader over its live rows.
 pub fn open(
-    location: &FileLocation,
-    file_size: i64,
+    file: &DataFile,
+    physical_schema: SchemaRef,
     deleted: Option<&[u64]>,
-    projected_columns: &[String],
-    batch_size: i64,
 ) -> Result<impl RecordBatchReader + Send + 'static, String> {
-    #[allow(deprecated)]
-    shared_runtime().block_on(async {
-        let mut reader = ParquetObjectReader::new(location.store.clone(), location.path.clone());
-        if file_size > 0 {
-            reader = reader.with_file_size(file_size as u64);
-        }
-        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| format!("open parquet: {e}"))?;
-        if batch_size > 0 {
-            builder = builder.with_batch_size(batch_size as usize);
-        }
-        if !projected_columns.is_empty() {
-            // `ProjectionMask::columns` silently drops names it cannot find; a missing column would
-            // then shift every column after it, so check up front.
-            let file_schema = builder.schema().clone();
-            for c in projected_columns {
-                if file_schema.field_with_name(c).is_err() {
-                    return Err(format!("column {c} not found in {}", location.path));
-                }
-            }
-            let mask = ProjectionMask::columns(
-                builder.parquet_schema(),
-                projected_columns.iter().map(String::as_str),
-            );
-            builder = builder.with_projection(mask);
-        }
-        if let Some(deleted) = deleted {
-            let num_rows = builder.metadata().file_metadata().num_rows() as u64;
-            builder = builder.with_row_selection(selection_from_deleted(deleted, num_rows)?);
-        }
-        let schema = builder.schema().clone();
-        let stream = builder.build().map_err(|e| format!("build reader: {e}"))?;
-        Ok(BlockingReader { stream, schema })
+    let arrow_schema: ArrowSchema = physical_schema
+        .as_ref()
+        .try_into_arrow()
+        .map_err(|e: ArrowError| format!("schema to arrow: {e}"))?;
+    let batches = shared_engine()
+        .parquet_handler()
+        .read_parquet_files(std::slice::from_ref(&file.meta), physical_schema, None)
+        .map_err(|e| format!("open parquet: {e}"))?;
+    Ok(LiveRows {
+        batches,
+        schema: Arc::new(arrow_schema),
+        deleted: deleted.map(<[u64]>::to_vec).unwrap_or_default(),
+        cursor: 0,
+        row_offset: 0,
+        done: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Int32Array;
+    use delta_kernel::EngineData;
+
+    fn live_rows(batches: Vec<(i32, i32)>, deleted: Vec<u64>) -> LiveRows {
+        let data: Vec<delta_kernel::KernelResult<Box<dyn EngineData>>> = batches
+            .into_iter()
+            .map(|(start, n)| {
+                let col = Int32Array::from((start..start + n).collect::<Vec<_>>());
+                let b = RecordBatch::try_from_iter([("v", Arc::new(col) as _)]).unwrap();
+                Ok(Box::new(ArrowEngineData::new(b)) as Box<dyn EngineData>)
+            })
+            .collect();
+        LiveRows {
+            batches: Box::new(data.into_iter()),
+            schema: Arc::new(ArrowSchema::empty()),
+            deleted,
+            cursor: 0,
+            row_offset: 0,
+            done: false,
+        }
+    }
+
+    #[test]
+    fn dv_past_the_end_of_the_file_is_an_error() {
+        let results: Vec<_> = live_rows(vec![(0, 4)], vec![1, 9]).collect();
+        assert!(results[0].is_ok());
+        let err = results[1].as_ref().unwrap_err().to_string();
+        assert!(
+            err.contains("references row 9 but the file has 4 rows"),
+            "{err}"
+        );
+        assert_eq!(results.len(), 2, "stream ends after the error");
+    }
+
+    #[test]
+    fn dv_inside_the_file_ends_cleanly() {
+        let results: Vec<_> = live_rows(vec![(0, 4), (4, 4)], vec![3, 4]).collect();
+        assert!(results.iter().all(|r| r.is_ok()));
+        assert_eq!(results.len(), 2);
+    }
 }

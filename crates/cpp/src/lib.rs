@@ -19,11 +19,10 @@ pub mod ffi {
         /// Deletion vector descriptor as JSON (the decoded `row_index_filter_id_encoded`); ""
         /// means the file has no DV.
         dv_descriptor_json: String,
-        /// Physical column names to read; empty reads every column. A name missing from the file
-        /// is an error, not a silent drop.
-        projected_columns: Vec<String>,
-        /// Rows per batch; <= 0 uses the parquet default.
-        batch_size: i64,
+        /// Physical schema to read, as Delta schema JSON (the shape of a table's `schemaString`),
+        /// using physical column names and carrying field-id metadata where the table has it.
+        /// Required. The kernel matches file columns by field id, then name, and widens types.
+        physical_schema_json: String,
         /// Reserved for object-store options.
         props_keys: Vec<String>,
         props_values: Vec<String>,
@@ -52,39 +51,33 @@ pub mod ffi {
 
 /// A validated split: location, resolved deleted rows and read options.
 pub struct DeltaFileReader {
-    location: reader::FileLocation,
-    file_size: i64,
+    file: reader::DataFile,
+    schema: delta_kernel::schema::SchemaRef,
     deleted: Option<Vec<u64>>,
-    projected_columns: Vec<String>,
-    batch_size: i64,
 }
 
 pub fn new_delta_file_reader(
     ctx: ffi::FfiDeltaScanContext,
 ) -> Result<Box<DeltaFileReader>, String> {
     guard_no_runtime("new_delta_file_reader")?;
-    let location = reader::resolve_file(&ctx.file_path)?;
-    let engine = reader::default_engine();
-    let deleted = reader::resolve_deleted_rows(&ctx.dv_descriptor_json, &ctx.table_root, &engine)?;
+    let file = reader::resolve_file(&ctx.file_path, ctx.file_size)?;
+    let schema = reader::parse_schema(&ctx.physical_schema_json)?;
+    let deleted = reader::resolve_deleted_rows(
+        &ctx.dv_descriptor_json,
+        &ctx.table_root,
+        reader::shared_engine(),
+    )?;
     Ok(Box::new(DeltaFileReader {
-        location,
-        file_size: ctx.file_size,
+        file,
+        schema,
         deleted,
-        projected_columns: ctx.projected_columns,
-        batch_size: ctx.batch_size,
     }))
 }
 
 impl DeltaFileReader {
     pub fn read(&self) -> Result<*mut ffi::ArrowArrayStream, String> {
         guard_no_runtime("read")?;
-        let reader = reader::open(
-            &self.location,
-            self.file_size,
-            self.deleted.as_deref(),
-            &self.projected_columns,
-            self.batch_size,
-        )?;
+        let reader = reader::open(&self.file, self.schema.clone(), self.deleted.as_deref())?;
         Ok(util::create_raw_pointer_for_record_batch_reader(reader))
     }
 }
